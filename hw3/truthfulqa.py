@@ -208,8 +208,9 @@ class MultipleChoicePipeline(Pipeline):
             as well as the input_ids tensor from input_
         """
         with torch.no_grad():
-            logic_score = self.model(**input_)
-            logits = logic_score.logits.detach()
+            with torch.cuda.amp.autocast():
+                logic_score = self.model(**input_)
+                logits = logic_score.logits.detach()
         return {"input_ids": input_["input_ids"], "logits": logits}
 
     def postprocess(self, outputs: Dict[str, torch.Tensor]) -> Output:

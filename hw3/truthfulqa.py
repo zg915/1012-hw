@@ -207,9 +207,9 @@ class MultipleChoicePipeline(Pipeline):
         :return: The logit scores assigned to each next-token prediction
             as well as the input_ids tensor from input_
         """
-
-        logic_score = self.model(**input_)
-        logits = logic_score.logits.detach()
+        with torch.no_grad():
+            logic_score = self.model(**input_)
+            logits = logic_score.logits.detach()
         return {"input_ids": input_["input_ids"], "logits": logits}
 
     def postprocess(self, outputs: Dict[str, torch.Tensor]) -> Output:
@@ -231,41 +231,42 @@ class MultipleChoicePipeline(Pipeline):
             responds to question i and column j corresponds to answer
             choice j
         """
-        token_ids = outputs["input_ids"]             # shape [4*x, seq_len]
-        logits = outputs["logits"]                   # shape [4*x, seq_len, vocab_size]
-        batch_size, seq_len, vocab_size = logits.shape
-        # e.g., batch_size = 4*x
+        with torch.no_grad():
+            token_ids = outputs["input_ids"]             # shape [4*x, seq_len]
+            logits = outputs["logits"]                   # shape [4*x, seq_len, vocab_size]
+            batch_size, seq_len, vocab_size = logits.shape
+            # e.g., batch_size = 4*x
 
-        # ------------------------------------------------
-        # We drop the last logits row (can't predict beyond seq_len-1)
-        # We drop the first token (it wasn't predicted by anything prior)
-        # So new shape => [4*x, seq_len-1] for both
-        shifted_logits = logits[:, :-1, :].contiguous()   # shape [4*x, seq_len-1, vocab_size]
-        shifted_token_ids = token_ids[:, 1:].contiguous() # shape [4*x, seq_len-1]
+            # ------------------------------------------------
+            # We drop the last logits row (can't predict beyond seq_len-1)
+            # We drop the first token (it wasn't predicted by anything prior)
+            # So new shape => [4*x, seq_len-1] for both
+            shifted_logits = logits[:, :-1, :].contiguous()   # shape [4*x, seq_len-1, vocab_size]
+            shifted_token_ids = token_ids[:, 1:].contiguous() # shape [4*x, seq_len-1]
 
-        # Flatten so each token is a separate row
-        # => logits_flat: [4*x*(seq_len-1), vocab_size]
-        # => token_ids_flat: [4*x*(seq_len-1)]
-        logits_flat = shifted_logits.view(-1, vocab_size)
-        token_ids_flat = shifted_token_ids.view(-1)
+            # Flatten so each token is a separate row
+            # => logits_flat: [4*x*(seq_len-1), vocab_size]
+            # => token_ids_flat: [4*x*(seq_len-1)]
+            logits_flat = shifted_logits.view(-1, vocab_size)
+            token_ids_flat = shifted_token_ids.view(-1)
 
-        nll_per_token = nn.functional.cross_entropy(logits_flat, token_ids_flat, reduction="none")
-        pad_token_id = 50256
-        mask = (token_ids_flat != pad_token_id).float()
+            nll_per_token = nn.functional.cross_entropy(logits_flat, token_ids_flat, reduction="none")
+            pad_token_id = 50256
+            mask = (token_ids_flat != pad_token_id).float()
 
-        masked_nll_per_token = nll_per_token * mask
+            masked_nll_per_token = nll_per_token * mask
 
-        seq_len_minus_1 = shifted_logits.shape[1]  # i.e. seq_len - 1
-        masked_nll_sums = masked_nll_per_token.view(batch_size, seq_len_minus_1).sum(dim=1)
-        # shape => [4*x]
+            seq_len_minus_1 = shifted_logits.shape[1]  # i.e. seq_len - 1
+            masked_nll_sums = masked_nll_per_token.view(batch_size, seq_len_minus_1).sum(dim=1)
+            # shape => [4*x]
 
-        x = batch_size // 4
-        losses_2d = masked_nll_sums.view(x, 4)
+            x = batch_size // 4
+            losses_2d = masked_nll_sums.view(x, 4)
 
-        predictions = losses_2d.argmin(dim=1)  # shape [x]
+            predictions = losses_2d.argmin(dim=1)  # shape [x]
 
-        loss_array = losses_2d.detach().cpu().numpy()
-        pred_array = predictions.detach().cpu().numpy()
+            loss_array = losses_2d.detach().cpu().numpy()
+            pred_array = predictions.detach().cpu().numpy()
 
         return Output(loss=loss_array, prediction=pred_array)
 

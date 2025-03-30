@@ -209,6 +209,7 @@ class MultipleChoicePipeline(Pipeline):
         """
         with torch.no_grad():
             with torch.cuda.amp.autocast():
+                self.model.eval()
                 logic_score = self.model(**input_)
                 logits = logic_score.logits.detach()
         return {"input_ids": input_["input_ids"], "logits": logits}

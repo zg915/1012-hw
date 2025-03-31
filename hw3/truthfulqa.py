@@ -165,14 +165,21 @@ class MultipleChoicePipeline(Pipeline):
                 text 5 corresponds to answer choice 1 for question 1,
                 etc.
         """
+        input_texts = []
+
         questions = batch["question"]
-        choices = batch["choices"]
-        results = []
-        for i in range(len(questions)):
-            choice_option = choices[i]
-            for choice in choice_option:
-                results.append(self._demos + "Q: " + questions[i] + "\nA:" + self._system_prompt + " " + choice)
-        return results
+        choices_list = batch["choices"]
+
+        def format_text(q, c):
+            return f"{self._demos}Q: {q}\nA:{self._system_prompt} {c}"
+
+        for q_idx, question in enumerate(questions):
+            for choice_idx in range(self.num_choices):
+                choice = choices_list[q_idx][choice_idx]
+                text = format_text(question, choice)
+                input_texts.append(text)
+
+        return input_texts
 
     def preprocess(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
@@ -191,8 +198,11 @@ class MultipleChoicePipeline(Pipeline):
             used; otherwise, they should be stored on the CPU
         """
         input_texts = self._get_input_texts(batch)
-        tokens = self.tokenizer(input_texts, padding=True, return_tensors="pt")
-        return tokens.to(self.device)
+        
+        encoded_inputs = self.tokenizer(input_texts,
+                                        padding = True, 
+                                        return_tensors = 'pt')
+        return encoded_inputs
 
     def _forward(self, input_: Dict[str, torch.Tensor]) -> \
             Dict[str, torch.Tensor]:
@@ -207,12 +217,13 @@ class MultipleChoicePipeline(Pipeline):
         :return: The logit scores assigned to each next-token prediction
             as well as the input_ids tensor from input_
         """
-        with torch.no_grad():
-            with torch.cuda.amp.autocast():
-                self.model.eval()
-                logic_score = self.model(**input_)
-                logits = logic_score.logits.detach()
-        return {"input_ids": input_["input_ids"], "logits": logits}
+        with torch.no_grad(): 
+            outputs = self.model(**input_)
+    
+        return {
+            "logits": outputs.logits,
+            "input_ids": input_["input_ids"]
+            }
 
     def postprocess(self, outputs: Dict[str, torch.Tensor]) -> Output:
         """
@@ -233,46 +244,42 @@ class MultipleChoicePipeline(Pipeline):
             responds to question i and column j corresponds to answer
             choice j
         """
-        with torch.no_grad():
-            token_ids = outputs["input_ids"]             # shape [4*x, seq_len]
-            logits = outputs["logits"]                   # shape [4*x, seq_len, vocab_size]
-            batch_size, seq_len, vocab_size = logits.shape
-            # e.g., batch_size = 4*x
+        logits = outputs["logits"]
+        input_ids = outputs["input_ids"]
 
-            # ------------------------------------------------
-            # We drop the last logits row (can't predict beyond seq_len-1)
-            # We drop the first token (it wasn't predicted by anything prior)
-            # So new shape => [4*x, seq_len-1] for both
-            shifted_logits = logits[:, :-1, :].contiguous()   # shape [4*x, seq_len-1, vocab_size]
-            shifted_token_ids = token_ids[:, 1:].contiguous() # shape [4*x, seq_len-1]
+        # Shift the inputs and targets for language modeling
+        # The target is the next token in the sequence
+        shifted_logits = logits[:, :-1, :]  # Remove last position
+        shifted_targets = input_ids[:, 1:]  # Remove first position
 
-            # Flatten so each token is a separate row
-            # => logits_flat: [4*x*(seq_len-1), vocab_size]
-            # => token_ids_flat: [4*x*(seq_len-1)]
-            logits_flat = shifted_logits.view(-1, vocab_size)
-            token_ids_flat = shifted_token_ids.view(-1)
+        # Create a mask to ignore padding tokens in the targets
+        # We need to exclude padding tokens from the loss calculation
+        padding_mask = (shifted_targets != self.tokenizer.pad_token_id).float()
 
-            nll_per_token = nn.functional.cross_entropy(logits_flat, token_ids_flat, reduction="none")
-            pad_token_id = 50256
-            mask = (token_ids_flat != pad_token_id).float()
+        # Calculate token-level loss
+        batch_size, seq_length, vocab_size = shifted_logits.size()
+        shifted_logits_flat = shifted_logits.reshape(-1, vocab_size)
+        shifted_targets_flat = shifted_targets.reshape(-1)
 
-            masked_nll_per_token = nll_per_token * mask
+        # Calculate cross-entropy loss for all tokens
+        token_losses = self.loss_fn(shifted_logits_flat, shifted_targets_flat)
+        token_losses = token_losses.reshape(batch_size, seq_length)
 
-            seq_len_minus_1 = shifted_logits.shape[1]  # i.e. seq_len - 1
-            masked_nll_sums = masked_nll_per_token.view(batch_size, seq_len_minus_1).sum(dim=1)
-            # shape => [4*x]
+        # Apply padding mask to exclude padding tokens from loss calculation
+        masked_token_losses = token_losses * padding_mask
 
-            x = batch_size // 4
-            losses_2d = masked_nll_sums.view(x, 4)
+        # Sum the losses without normalizing by sequence length
+        text_losses = masked_token_losses.sum(dim=1)
 
-            predictions = losses_2d.argmin(dim=1)  # shape [x]
+        # Reshape into a matrix where each row is a question and each column is an answer choice
+        num_questions = batch_size // self.num_choices
+        loss_matrix = text_losses.reshape(num_questions, self.num_choices)
 
-            loss_array = losses_2d.detach().cpu().numpy()
-            pred_array = predictions.detach().cpu().numpy()
+        # Choose the answer with the lowest loss for each question
+        predictions = torch.argmin(loss_matrix, dim=1).cpu().numpy()
 
-        return Output(loss=loss_array, prediction=pred_array)
-
-
+        # Return the predictions and loss matrix in the required Output format
+        return Output(loss=loss_matrix.cpu().numpy(), prediction=predictions)
 
 def run_model(pipeline: MultipleChoicePipeline, dataset: Dataset,
               batch_size: int = 10) -> Output:

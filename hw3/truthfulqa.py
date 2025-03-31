@@ -242,6 +242,10 @@ class MultipleChoicePipeline(Pipeline):
         token_ids_flat = shifted_token_ids.view(-1)
 
         # nll_per_token = nn.functional.cross_entropy(logits_flat, token_ids_flat, reduction="none")
+        # pad_token_id = self.tokenizer.pad_token_id
+        # mask = (token_ids_flat != pad_token_id).float()
+
+        # masked_nll_per_token = nll_per_token
         nll_per_token = self.loss_fn(logits_flat, token_ids_flat)
 
         seq_len_minus_1 = shifted_logits.shape[1]  # i.e. seq_len - 1

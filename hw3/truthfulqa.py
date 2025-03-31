@@ -252,7 +252,7 @@ class MultipleChoicePipeline(Pipeline):
         masked_nll_sums = masked_nll_per_token.view(batch_size, seq_len_minus_1).sum(dim=1)
         # shape => [4*x]
 
-        losses_2d = masked_nll_sums.view(batch_size // self.num_choices, self.num_choices)
+        losses_2d = masked_nll_sums.view(batch_size // 4, 4)
 
         predictions = losses_2d.argmin(dim=1)  # shape [x]
 
